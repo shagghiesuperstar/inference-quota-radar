@@ -1,0 +1,14 @@
+.env
+.env.*
+*.pem
+*.key
+**/credentials.json
+**/.credentials.json
+**/auth.json
+target/
+.cargo-cache/
+*.har
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
