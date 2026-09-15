@@ -3,6 +3,7 @@
 
 Shadow mode: advise headroom only; never gate routing; never write secrets.
 Reads keys from environment only (Hermes/BWS inject). Honest STUB when no API.
+No fabricated quota numbers — pct_remaining is None unless computed from real data.
 """
 from __future__ import annotations
 
@@ -10,21 +11,27 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 SCHEMA = "radar.phase1"
-UA = "hermes-quota-radar/0.2"
+UA = "hermes-quota-radar/0.3"
 TIMEOUT = 20
 
 # Thresholds (headroom watching — not spend maximization)
 EXCLUDE_PCT = 10.0
 WARN_PCT = 25.0
 STALE_HOURS = 2.0
+
+# error_class taxonomy (honest, machine-readable)
+# KEY_UNSET | AUTH_FAILED | FORBIDDEN | RATE_LIMITED | TIMEOUT | NETWORK |
+# HTTP_ERROR | PARSE | CLI_MISSING | CLI_FAILED | NO_PUBLIC_API | UNHANDLED
 
 
 def _now() -> str:
@@ -34,120 +41,202 @@ def _now() -> str:
 def _env(*names: str) -> Optional[str]:
     for n in names:
         v = os.environ.get(n)
-        if v:
-            return v
+        if v and str(v).strip():
+            return str(v).strip()
     return None
 
 
-def _get_json(url: str, key: Optional[str] = None, headers: Optional[dict] = None) -> Any:
+def _classify_http(exc: BaseException) -> tuple[str, str]:
+    """Return (error_class, note) for urllib/network failures."""
+    if isinstance(exc, socket.timeout) or isinstance(exc, TimeoutError):
+        return "TIMEOUT", f"timeout: {exc}"
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        body = ""
+        try:
+            body = (exc.read() or b"")[:120].decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        if code in (401,):
+            return "AUTH_FAILED", f"HTTP {code}: {body}".strip()
+        if code in (403,):
+            return "FORBIDDEN", f"HTTP {code}: {body}".strip()
+        if code == 429:
+            return "RATE_LIMITED", f"HTTP {code}: {body}".strip()
+        return "HTTP_ERROR", f"HTTP {code}: {body}".strip()
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return "TIMEOUT", f"timeout: {reason}"
+        return "NETWORK", f"network: {reason}"
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "NETWORK", f"network: {exc}"
+    if isinstance(exc, (json.JSONDecodeError, ValueError, KeyError, TypeError)):
+        return "PARSE", f"parse: {exc}"
+    return "UNHANDLED", str(exc)
+
+
+def _get_json(
+    url: str,
+    key: Optional[str] = None,
+    headers: Optional[dict] = None,
+    timeout: float = TIMEOUT,
+) -> Any:
     hdrs = {"User-Agent": UA, "Accept": "application/json"}
     if key:
         hdrs["Authorization"] = f"Bearer {key}"
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
-def _stub(provider: str, reason: str, mechanism: str, confidence: str) -> dict:
-    return {
+def _row(
+    provider: str,
+    status: str,
+    mechanism: str,
+    confidence: str,
+    *,
+    pct: Optional[float] = None,
+    raw: Any = None,
+    note: Optional[str] = None,
+    error_class: Optional[str] = None,
+    **extra: Any,
+) -> dict:
+    out: dict[str, Any] = {
         "provider": provider,
-        "status": "STUB",
+        "status": status,  # OK | PARTIAL | STUB | ERROR
         "mechanism": mechanism,
-        "confidence": confidence,
-        "pct_remaining": None,
-        "raw": None,
-        "note": reason,
-    }
-
-
-def _ok(provider: str, mechanism: str, confidence: str, pct: Optional[float], raw: Any, **extra) -> dict:
-    row = {
-        "provider": provider,
-        "status": "OK",
-        "mechanism": mechanism,
-        "confidence": confidence,
-        "pct_remaining": pct,
+        "confidence": confidence,  # VERIFIED | INFERRED | UNKNOWN
+        "pct_remaining": pct,  # never fabricate
         "raw": raw,
-        "note": None,
+        "note": note,
+        "error_class": error_class,
     }
-    row.update(extra)
-    return row
+    out.update(extra)
+    return out
 
 
-def _err(provider: str, mechanism: str, confidence: str, err: str) -> dict:
-    return {
-        "provider": provider,
-        "status": "ERROR",
-        "mechanism": mechanism,
-        "confidence": confidence,
-        "pct_remaining": None,
-        "raw": None,
-        "note": err,
-    }
+def _stub(provider: str, reason: str, mechanism: str, confidence: str, **extra: Any) -> dict:
+    return _row(
+        provider, "STUB", mechanism, confidence,
+        note=reason, error_class="NO_PUBLIC_API", **extra,
+    )
 
 
-# ---- providers -------------------------------------------------------------
+def _ok(
+    provider: str,
+    mechanism: str,
+    confidence: str,
+    pct: Optional[float],
+    raw: Any,
+    **extra: Any,
+) -> dict:
+    status = "OK" if pct is not None else "PARTIAL"
+    return _row(provider, status, mechanism, confidence, pct=pct, raw=raw, **extra)
+
+
+def _err(
+    provider: str,
+    mechanism: str,
+    confidence: str,
+    err: str,
+    error_class: str = "UNHANDLED",
+    **extra: Any,
+) -> dict:
+    return _row(
+        provider, "ERROR", mechanism, confidence,
+        note=err, error_class=error_class, **extra,
+    )
+
+
+def _from_exc(
+    provider: str,
+    mechanism: str,
+    confidence: str,
+    exc: BaseException,
+) -> dict:
+    ec, note = _classify_http(exc)
+    return _err(provider, mechanism, confidence, note, error_class=ec)
+
+
+def _caut_bin() -> Optional[str]:
+    """Prefer PATH caut, then known box work-tree release path if present."""
+    which = shutil.which("caut")
+    if which:
+        return which
+    candidates = [
+        "/workspace/inference-quota-radar-work/caut-hermes/target/release/caut",
+        os.path.expanduser("~/bin/caut"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+# ---- providers (live / partial) --------------------------------------------
 
 def fetch_openrouter() -> dict:
     key = _env("OPENROUTER_API_KEY")
     if not key:
-        return _err("openrouter", "apiToken", "VERIFIED", "OPENROUTER_API_KEY unset")
+        return _err("openrouter", "apiToken", "VERIFIED", "OPENROUTER_API_KEY unset", "KEY_UNSET")
     try:
         data = _get_json("https://openrouter.ai/api/v1/key", key)
-        # documented: data.limit / limit_remaining / limit_reset (shape may nest under "data")
         payload = data.get("data", data) if isinstance(data, dict) else data
+        if not isinstance(payload, dict):
+            return _err("openrouter", "apiToken", "VERIFIED", "unexpected payload shape", "PARSE")
         limit = payload.get("limit")
         rem = payload.get("limit_remaining")
         pct = None
         if isinstance(limit, (int, float)) and limit and isinstance(rem, (int, float)):
-            pct = round(100.0 * rem / limit, 2)
+            pct = round(100.0 * float(rem) / float(limit), 2)
         elif isinstance(rem, (int, float)) and limit is None:
-            # unlimited key — treat as high headroom
+            # unlimited key — treat as high headroom (documented API semantics)
             pct = 100.0
         return _ok(
             "openrouter", "apiToken", "VERIFIED", pct, payload,
             limit=limit, limit_remaining=rem, limit_reset=payload.get("limit_reset"),
         )
     except Exception as e:
-        return _err("openrouter", "apiToken", "VERIFIED", str(e))
+        return _from_exc("openrouter", "apiToken", "VERIFIED", e)
 
 
 def fetch_deepseek() -> dict:
     key = _env("DEEPSEEK_API_KEY")
     if not key:
-        return _err("deepseek", "apiToken", "VERIFIED", "DEEPSEEK_API_KEY unset")
+        return _err("deepseek", "apiToken", "VERIFIED", "DEEPSEEK_API_KEY unset", "KEY_UNSET")
     try:
         data = _get_json("https://api.deepseek.com/user/balance", key)
-        # balance_infos[].total_balance — prepaid; % needs budget baseline
-        infos = data.get("balance_infos") or []
+        infos = data.get("balance_infos") if isinstance(data, dict) else None
         total = None
         if infos and isinstance(infos, list):
             try:
                 total = float(infos[0].get("total_balance"))
-            except (TypeError, ValueError, IndexError):
+            except (TypeError, ValueError, IndexError, AttributeError):
                 total = None
         budget = _env("DEEPSEEK_BUDGET_USD")
         pct = None
+        note = "prepaid balance; set DEEPSEEK_BUDGET_USD for pct_remaining"
         if total is not None and budget:
             try:
                 b = float(budget)
                 if b > 0:
                     pct = round(100.0 * min(total, b) / b, 2)
+                    note = None
             except ValueError:
                 pass
         return _ok(
             "deepseek", "apiToken", "VERIFIED", pct, data,
-            balance_usd=total, is_available=data.get("is_available"),
-            note="prepaid balance; set DEEPSEEK_BUDGET_USD for pct_remaining",
+            balance_usd=total, is_available=(data.get("is_available") if isinstance(data, dict) else None),
+            note=note,
         )
     except Exception as e:
-        return _err("deepseek", "apiToken", "VERIFIED", str(e))
+        return _from_exc("deepseek", "apiToken", "VERIFIED", e)
 
 
 def fetch_minimax() -> dict:
-    # Prefer mmx CLI quota show (verified on box)
     if shutil.which("mmx"):
         try:
             p = subprocess.run(
@@ -155,173 +244,369 @@ def fetch_minimax() -> dict:
                 capture_output=True, text=True, timeout=30,
             )
             if p.returncode == 0 and p.stdout.strip():
-                data = json.loads(p.stdout)
+                try:
+                    data = json.loads(p.stdout)
+                except json.JSONDecodeError as e:
+                    return _err("minimax", "cli", "VERIFIED", f"mmx JSON parse: {e}", "PARSE")
                 remains = data.get("model_remains") or []
-                # Prefer "general" interval remaining %
                 pct = None
                 for m in remains:
-                    if m.get("model_name") == "general":
+                    if isinstance(m, dict) and m.get("model_name") == "general":
                         pct = m.get("current_interval_remaining_percent")
                         break
-                if pct is None and remains:
+                if pct is None and remains and isinstance(remains[0], dict):
                     pct = remains[0].get("current_interval_remaining_percent")
+                if pct is not None and not isinstance(pct, (int, float)):
+                    pct = None
                 return _ok("minimax", "cli", "VERIFIED", pct, data, via="mmx quota show")
-            return _err("minimax", "cli", "VERIFIED", f"mmx rc={p.returncode}: {(p.stderr or '')[:200]}")
+            return _err(
+                "minimax", "cli", "VERIFIED",
+                f"mmx rc={p.returncode}: {(p.stderr or '')[:200]}",
+                "CLI_FAILED",
+            )
+        except subprocess.TimeoutExpired:
+            return _err("minimax", "cli", "VERIFIED", "mmx quota show timed out", "TIMEOUT")
         except Exception as e:
-            return _err("minimax", "cli", "VERIFIED", str(e))
-    # No public usage REST — meter/stub
+            return _err("minimax", "cli", "VERIFIED", str(e), "CLI_FAILED")
     if _env("MINIMAX_API_KEY", "MINIMAX_API_KEY1ST"):
         return _stub(
             "minimax",
-            "mmx CLI missing; no public usage API — use metered Hermes logs later",
+            "mmx CLI missing; no public usage REST — meter Hermes logs later (key present)",
             "metered",
             "VERIFIED",
         )
-    return _err("minimax", "cli", "VERIFIED", "mmx not on PATH and MINIMAX_API_KEY unset")
+    return _err(
+        "minimax", "cli", "VERIFIED",
+        "mmx not on PATH and MINIMAX_API_KEY unset",
+        "CLI_MISSING",
+    )
 
 
 def fetch_xai() -> dict:
-    key = _env("XAI_API_KEY")
+    key = _env("XAI_API_KEY", "GROK_API_KEY")
     if not key:
-        return _err("xai", "metered", "VERIFIED", "XAI_API_KEY unset")
-    # No public credits REST [VERIFIED] — honest stub with metered path note
-    return _stub(
-        "xai",
-        "no public credits endpoint; spend-tier RPS/TPM only — meter Hermes session spend vs monthly budget",
-        "metered",
-        "VERIFIED",
-    )
+        return _err("xai", "metered", "VERIFIED", "XAI_API_KEY unset", "KEY_UNSET")
+    # Optional liveness probe — still no public credits REST
+    try:
+        data = _get_json("https://api.x.ai/v1/models", key)
+        models = data.get("data") if isinstance(data, dict) else None
+        n = len(models) if isinstance(models, list) else None
+        return _row(
+            "xai", "PARTIAL", "metered", "VERIFIED",
+            pct=None,
+            raw={"models_visible": n},
+            note="key live; no public credits-remaining REST — meter Hermes session spend vs budget",
+            coverage="partial",
+        )
+    except Exception as e:
+        # Key may still be valid for chat; classify but keep honest no-credits note on auth fail
+        ec, note = _classify_http(e)
+        if ec in ("AUTH_FAILED", "FORBIDDEN"):
+            return _err("xai", "apiToken", "VERIFIED", note, ec)
+        return _stub(
+            "xai",
+            f"models probe failed ({note}); no public credits endpoint — meter later",
+            "metered",
+            "VERIFIED",
+        )
 
 
 def fetch_openai() -> dict:
     key = _env("OPENAI_API_KEY")
     if not key:
-        return _err("openai", "apiToken", "VERIFIED", "OPENAI_API_KEY unset")
-    # Usage API exists but needs org admin + date range; Phase1: probe auth only
+        return _err("openai", "apiToken", "VERIFIED", "OPENAI_API_KEY unset", "KEY_UNSET")
     try:
-        # lightweight authenticated probe — models list proves key alive
         data = _get_json("https://api.openai.com/v1/models", key)
         models = data.get("data") if isinstance(data, dict) else None
-        return _ok(
-            "openai", "apiToken", "INFERRED", None,
-            {"models_sample": [m.get("id") for m in (models or [])[:5]]},
+        return _row(
+            "openai", "PARTIAL", "apiToken", "INFERRED",
+            pct=None,
+            raw={"models_sample": [m.get("id") for m in (models or [])[:5] if isinstance(m, dict)]},
             note="key live; usage/completions quota needs Usage API + budget baseline (later)",
+            coverage="partial",
         )
     except Exception as e:
-        return _err("openai", "apiToken", "VERIFIED", str(e))
+        return _from_exc("openai", "apiToken", "VERIFIED", e)
 
 
-def fetch_anthropic_claude() -> dict:
-    # Prefer caut if built; else CLI `claude` usage if present; else stub
-    if shutil.which("caut"):
-        try:
-            p = subprocess.run(
-                ["caut", "usage", "--json", "--provider", "claude"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if p.returncode == 0 and p.stdout.strip():
-                data = json.loads(p.stdout)
-                return _ok("claude", "cli", "VERIFIED", None, data, via="caut usage")
-            return _err("claude", "cli", "VERIFIED", f"caut rc={p.returncode}: {(p.stderr or '')[:200]}")
-        except Exception as e:
-            return _err("claude", "cli", "VERIFIED", str(e))
-    if shutil.which("claude"):
-        return _stub(
-            "claude",
-            "claude CLI present but caut binary missing — wire caut OAuth fetch after build",
-            "cli",
-            "VERIFIED",
+def fetch_anthropic() -> dict:
+    """Anthropic API-key path (liveness). Subscription headroom → claude_oauth/caut."""
+    key = _env("ANTHROPIC_API_KEY")
+    if not key:
+        return _err(
+            "anthropic", "apiToken", "INFERRED",
+            "ANTHROPIC_API_KEY unset (subscription usage → claude_oauth/caut)",
+            "KEY_UNSET",
         )
-    if _env("ANTHROPIC_API_KEY"):
-        return _stub(
-            "claude",
-            "ANTHROPIC_API_KEY present but no public usage REST for API keys; caut OAuth path preferred",
-            "apiToken",
-            "INFERRED",
+    try:
+        data = _get_json(
+            "https://api.anthropic.com/v1/models",
+            key=None,
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "User-Agent": UA,
+                "Accept": "application/json",
+            },
         )
-    return _stub("claude", "caut not built; no ANTHROPIC_API_KEY; use Claude Code OAuth via caut later", "oauth", "VERIFIED")
-
-
-def fetch_codex() -> dict:
-    if shutil.which("caut"):
-        try:
-            p = subprocess.run(
-                ["caut", "usage", "--json", "--provider", "codex"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if p.returncode == 0 and p.stdout.strip():
-                return _ok("codex", "webDashboard", "VERIFIED", None, json.loads(p.stdout), via="caut")
-            return _err("codex", "webDashboard", "VERIFIED", f"caut rc={p.returncode}")
-        except Exception as e:
-            return _err("codex", "webDashboard", "VERIFIED", str(e))
-    return _stub("codex", "caut not built — Codex usage via caut web-dashboard/CLI-RPC later", "webDashboard", "VERIFIED")
+        return _row(
+            "anthropic", "PARTIAL", "apiToken", "INFERRED",
+            pct=None,
+            raw={"raw_keys": list(data)[:8] if isinstance(data, dict) else type(data).__name__},
+            note="API key live/models; no simple remaining-quota REST — prefer claude_oauth via caut",
+            coverage="partial",
+        )
+    except Exception as e:
+        return _from_exc("anthropic", "apiToken", "INFERRED", e)
 
 
 def fetch_nvidia() -> dict:
-    key = _env("NVIDIA_API_KEY", "NIM_API_KEY_1", "NIM_API_KEY_2", "NIM_API_KEY_3")
+    key = _env("NVIDIA_API_KEY", "NIM_API_KEY_1", "NIM_API_KEY_2", "NIM_API_KEY_3", "NGC_API_KEY")
     base = _env("NIM_BASE_URL", "NVIDIA_BASE_URL") or "https://integrate.api.nvidia.com/v1"
     if not key:
-        return _err("nvidia", "stub", "INFERRED", "NVIDIA_API_KEY / NIM_API_KEY_* unset")
-    # No verified public balance endpoint — probe models if possible
+        return _err(
+            "nvidia", "apiToken", "INFERRED",
+            "NVIDIA_API_KEY / NIM_API_KEY_* unset",
+            "KEY_UNSET",
+        )
     try:
         url = base.rstrip("/") + "/models"
         data = _get_json(url, key)
-        return _ok(
-            "nvidia", "apiToken", "INFERRED", None, {"probe": "models", "ok": True},
+        models = data.get("data") if isinstance(data, dict) else None
+        n = len(models) if isinstance(models, list) else None
+        return _row(
+            "nvidia", "PARTIAL", "apiToken", "INFERRED",
+            pct=None,
+            raw={"probe": "models", "models_visible": n, "ok": True},
             note="key/base live; no verified credits API — meter later",
             base_url=base,
+            coverage="partial",
         )
     except Exception as e:
-        return _stub("nvidia", f"probe failed ({e}); no verified credits API — STUB/meter", "metered", "INFERRED")
+        ec, note = _classify_http(e)
+        return _stub(
+            "nvidia",
+            f"probe failed ({note}); no verified credits API — STUB/meter",
+            "metered",
+            "INFERRED",
+            probe_error_class=ec,
+        )
 
 
 def fetch_gemini() -> dict:
-    key = _env("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_API_KEY")
+    key = _env("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_AI_STUDIO_API_KEY")
     if not key:
-        return _err("gemini", "stub", "INFERRED", "GOOGLE_API_KEY unset")
-    # AI Studio free-tier quotas are project-console based; no simple credits REST
-    return _stub(
-        "gemini",
-        "GOOGLE_API_KEY present; AI Studio quotas are console/project based — no simple credits REST — meter/stub",
-        "metered",
-        "INFERRED",
-    )
-
-
-def fetch_nous() -> dict:
-    if _env("NOUS_API_KEY"):
-        return _stub("nous", "NOUS_API_KEY present but OpenAPI has no balance — portal XHR or meter", "metered", "VERIFIED")
-    return _stub("nous", "no public balance API; portal UI only — meter Hermes logs or reverse USAGE XHR later", "stub", "VERIFIED")
+        return _err("gemini", "apiToken", "INFERRED", "GOOGLE_API_KEY unset", "KEY_UNSET")
+    try:
+        # AI Studio list models (key as query param — documented)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={urllib.parse.quote(key, safe='')}"
+        # Avoid putting key in Authorization; use bare request
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            data = json.loads(r.read().decode())
+        models = data.get("models") if isinstance(data, dict) else None
+        n = len(models) if isinstance(models, list) else None
+        return _row(
+            "gemini", "PARTIAL", "apiToken", "INFERRED",
+            pct=None,
+            raw={"models_visible": n},
+            note="AI Studio liveness; quotas are console/project based — no simple credits REST",
+            coverage="partial",
+        )
+    except Exception as e:
+        ec, note = _classify_http(e)
+        return _stub(
+            "gemini",
+            f"probe failed ({note}); AI Studio quotas console-based — meter/stub",
+            "metered",
+            "INFERRED",
+            probe_error_class=ec,
+        )
 
 
 def fetch_cerebras() -> dict:
-    if _env("CEREBRAS_API_KEY"):
-        return _stub("cerebras", "key present; no verified public balance REST — meter", "metered", "INFERRED")
-    return _stub("cerebras", "CEREBRAS_API_KEY not in env/BWS inventory — STUB", "stub", "UNKNOWN")
+    key = _env("CEREBRAS_API_KEY")
+    if not key:
+        return _stub(
+            "cerebras",
+            "CEREBRAS_API_KEY not in env — STUB (no verified public balance REST)",
+            "stub",
+            "UNKNOWN",
+        )
+    try:
+        data = _get_json("https://api.cerebras.ai/v1/models", key)
+        models = data.get("data") if isinstance(data, dict) else None
+        n = len(models) if isinstance(models, list) else None
+        return _row(
+            "cerebras", "PARTIAL", "apiToken", "INFERRED",
+            pct=None,
+            raw={"models_visible": n},
+            note="key live; no verified public balance REST — meter",
+            coverage="partial",
+        )
+    except Exception as e:
+        ec, note = _classify_http(e)
+        return _stub(
+            "cerebras",
+            f"probe failed ({note}); no verified balance REST — meter",
+            "metered",
+            "INFERRED",
+            probe_error_class=ec,
+        )
 
 
 def fetch_huggingface() -> dict:
-    if _env("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
-        return _stub("huggingface", "HF_TOKEN present; Inference credit APIs vary by product — meter/stub", "metered", "INFERRED")
-    return _err("huggingface", "stub", "INFERRED", "HF_TOKEN unset")
+    key = _env("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "HUGGINGFACE_API_KEY")
+    if not key:
+        return _err("huggingface", "apiToken", "INFERRED", "HF_TOKEN unset", "KEY_UNSET")
+    try:
+        data = _get_json("https://huggingface.co/api/whoami-v2", key)
+        return _row(
+            "huggingface", "PARTIAL", "apiToken", "INFERRED",
+            pct=None,
+            raw={
+                "name": data.get("name") if isinstance(data, dict) else None,
+                "type": data.get("type") if isinstance(data, dict) else None,
+            },
+            note="token identity OK; Inference credit APIs vary by product — meter/stub",
+            coverage="partial",
+        )
+    except Exception as e:
+        return _from_exc("huggingface", "apiToken", "INFERRED", e)
+
+
+# ---- stubs / caut-preferred ------------------------------------------------
+
+def fetch_nous() -> dict:
+    if _env("NOUS_API_KEY"):
+        return _stub(
+            "nous",
+            "NOUS_API_KEY present but OpenAPI has no balance — portal XHR or meter",
+            "metered",
+            "VERIFIED",
+        )
+    return _stub(
+        "nous",
+        "no public balance API; portal UI only — meter Hermes logs or reverse USAGE XHR later",
+        "stub",
+        "VERIFIED",
+    )
+
+
+def fetch_cursor() -> dict:
+    return _stub(
+        "cursor",
+        "subscription quota behind Cursor auth portal — no documented REST",
+        "stub",
+        "UNKNOWN",
+    )
+
+
+def fetch_codex() -> dict:
+    caut = _caut_bin()
+    if caut:
+        try:
+            p = subprocess.run(
+                [caut, "usage", "--json", "--provider", "codex"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if p.returncode == 0 and p.stdout.strip():
+                try:
+                    data = json.loads(p.stdout)
+                except json.JSONDecodeError as e:
+                    return _err("codex", "webDashboard", "VERIFIED", f"caut JSON: {e}", "PARSE")
+                return _ok("codex", "webDashboard", "VERIFIED", None, data, via=caut)
+            return _err(
+                "codex", "webDashboard", "VERIFIED",
+                f"caut rc={p.returncode}: {(p.stderr or '')[:200]}",
+                "CLI_FAILED",
+            )
+        except subprocess.TimeoutExpired:
+            return _err("codex", "webDashboard", "VERIFIED", "caut timed out", "TIMEOUT")
+        except Exception as e:
+            return _err("codex", "webDashboard", "VERIFIED", str(e), "CLI_FAILED")
+    return _stub(
+        "codex",
+        "caut not built — Codex usage via caut web-dashboard/CLI-RPC later (see docs/CAUT.md)",
+        "webDashboard",
+        "VERIFIED",
+    )
+
+
+def fetch_claude_oauth() -> dict:
+    caut = _caut_bin()
+    if caut:
+        try:
+            p = subprocess.run(
+                [caut, "usage", "--json", "--provider", "claude"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if p.returncode == 0 and p.stdout.strip():
+                try:
+                    data = json.loads(p.stdout)
+                except json.JSONDecodeError as e:
+                    return _err("claude_oauth", "oauth", "VERIFIED", f"caut JSON: {e}", "PARSE")
+                return _ok("claude_oauth", "oauth", "VERIFIED", None, data, via=caut)
+            return _err(
+                "claude_oauth", "oauth", "VERIFIED",
+                f"caut rc={p.returncode}: {(p.stderr or '')[:200]}",
+                "CLI_FAILED",
+            )
+        except subprocess.TimeoutExpired:
+            return _err("claude_oauth", "oauth", "VERIFIED", "caut timed out", "TIMEOUT")
+        except Exception as e:
+            return _err("claude_oauth", "oauth", "VERIFIED", str(e), "CLI_FAILED")
+    if shutil.which("claude"):
+        return _stub(
+            "claude_oauth",
+            "claude CLI present but caut binary missing — wire caut OAuth after build (docs/CAUT.md)",
+            "cli",
+            "VERIFIED",
+        )
+    return _stub(
+        "claude_oauth",
+        "caut not built — Claude Code / subscription usage via caut OAuth later (docs/CAUT.md)",
+        "oauth",
+        "VERIFIED",
+    )
+
+
+def fetch_devin() -> dict:
+    return _stub(
+        "devin",
+        "Cognition/Devin — no public quota API discovered",
+        "stub",
+        "UNKNOWN",
+    )
+
+
+def fetch_droid() -> dict:
+    return _stub(
+        "droid",
+        "Factory Droid — no public quota API discovered",
+        "stub",
+        "UNKNOWN",
+    )
+
+
+def fetch_cognition() -> dict:
+    return _stub(
+        "cognition",
+        "Same family as Devin — no public quota API; stub until documented",
+        "stub",
+        "UNKNOWN",
+    )
 
 
 def fetch_ai_gateway() -> dict:
     if _env("AI_GATEWAY_API_KEY"):
-        return _stub("ai-gateway", "AI_GATEWAY_API_KEY present; aggregator usage API UNKNOWN — meter", "metered", "UNKNOWN")
+        return _stub(
+            "ai-gateway",
+            "AI_GATEWAY_API_KEY present; aggregator usage API UNKNOWN — meter",
+            "metered",
+            "UNKNOWN",
+        )
     return _stub("ai-gateway", "no AI_GATEWAY_API_KEY — STUB", "stub", "UNKNOWN")
-
-
-def fetch_cursor() -> dict:
-    return _stub("cursor", "subscription quota behind Cursor auth portal — no documented REST", "stub", "UNKNOWN")
-
-
-def fetch_devin() -> dict:
-    return _stub("devin", "Cognition/Devin — no public quota API discovered", "stub", "UNKNOWN")
-
-
-def fetch_droid() -> dict:
-    return _stub("droid", "Factory Droid — no public quota API discovered", "stub", "UNKNOWN")
 
 
 def fetch_local_probe(name: str, base_url: str) -> dict:
@@ -330,10 +615,13 @@ def fetch_local_probe(name: str, base_url: str) -> dict:
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as r:
             _ = r.read(256)
-        return _ok(name, "localProbe", "VERIFIED", 100.0, {"base_url": base_url, "reachable": True},
-                   note="availability-gated infinite quota floor")
+        return _ok(
+            name, "localProbe", "VERIFIED", 100.0,
+            {"base_url": base_url, "reachable": True},
+            note="availability-gated infinite quota floor",
+        )
     except Exception as e:
-        return _err(name, "localProbe", "VERIFIED", f"unreachable {base_url}: {e}")
+        return _from_exc(name, "localProbe", "VERIFIED", e)
 
 
 PROVIDERS: list[tuple[str, Callable[[], dict]]] = [
@@ -342,17 +630,19 @@ PROVIDERS: list[tuple[str, Callable[[], dict]]] = [
     ("minimax", fetch_minimax),
     ("xai", fetch_xai),
     ("openai", fetch_openai),
-    ("claude", fetch_anthropic_claude),
-    ("codex", fetch_codex),
+    ("anthropic", fetch_anthropic),
     ("nvidia", fetch_nvidia),
     ("gemini", fetch_gemini),
-    ("nous", fetch_nous),
     ("cerebras", fetch_cerebras),
     ("huggingface", fetch_huggingface),
-    ("ai-gateway", fetch_ai_gateway),
+    ("nous", fetch_nous),
     ("cursor", fetch_cursor),
+    ("codex", fetch_codex),
+    ("claude_oauth", fetch_claude_oauth),
     ("devin", fetch_devin),
     ("droid", fetch_droid),
+    ("cognition", fetch_cognition),
+    ("ai-gateway", fetch_ai_gateway),
 ]
 
 
@@ -364,8 +654,7 @@ def collect(only: Optional[list[str]] = None) -> dict:
         try:
             rows.append(fn())
         except Exception as e:
-            rows.append(_err(name, "?", "UNKNOWN", f"unhandled: {e}"))
-    # optional local probes from env LOCAL_PROBE_URLS=url1,url2
+            rows.append(_err(name, "?", "UNKNOWN", f"unhandled: {e}", "UNHANDLED"))
     probes = _env("LOCAL_PROBE_URLS")
     if probes and not only:
         for i, u in enumerate(p.strip() for p in probes.split(",") if p.strip()):
@@ -375,15 +664,24 @@ def collect(only: Optional[list[str]] = None) -> dict:
         "generatedAt": _now(),
         "shadow": True,
         "mission": "quota-headroom-watching",
+        "errorTaxonomy": [
+            "KEY_UNSET", "AUTH_FAILED", "FORBIDDEN", "RATE_LIMITED", "TIMEOUT",
+            "NETWORK", "HTTP_ERROR", "PARSE", "CLI_MISSING", "CLI_FAILED",
+            "NO_PUBLIC_API", "UNHANDLED",
+        ],
         "providers": rows,
     }
 
 
 def status_for(row: dict, sprint_hours: Optional[float]) -> str:
-    if row.get("status") == "STUB":
+    st = row.get("status")
+    if st == "STUB":
         return "STUB"
-    if row.get("status") == "ERROR":
-        return f"ERROR: {(row.get('note') or '')[:60]}"
+    if st == "ERROR":
+        ec = row.get("error_class") or ""
+        return f"ERROR[{ec}]: {(row.get('note') or '')[:50]}"
+    if st == "PARTIAL":
+        return "PARTIAL (prefer meter / caut)"
     pct = row.get("pct_remaining")
     if pct is None:
         return "UNKNOWN (prefer local / meter)"
@@ -396,13 +694,14 @@ def status_for(row: dict, sprint_hours: Optional[float]) -> str:
 
 def render_md(env: dict, sprint_hours: Optional[float] = None) -> None:
     print(f"# inference-quota-radar {SCHEMA} (shadow) @ {env['generatedAt']}")
-    print("| Provider | Status | Mech | Conf | Remaining % | Note |")
-    print("|---|---|---|---|---|---|")
+    print("| Provider | Status | Mech | Conf | Remaining % | ErrClass | Note |")
+    print("|---|---|---|---|---|---|---|")
     for r in env["providers"]:
         print(
             f"| {r['provider']} | {status_for(r, sprint_hours)} | {r.get('mechanism')} | "
-            f"{r.get('confidence')} | {r.get('pct_remaining') if r.get('pct_remaining') is not None else '?'} | "
-            f"{(r.get('note') or '')[:80]} |"
+            f"{r.get('confidence')} | "
+            f"{r.get('pct_remaining') if r.get('pct_remaining') is not None else '?'} | "
+            f"{r.get('error_class') or '-'} | {(r.get('note') or '')[:70]} |"
         )
 
 
@@ -417,9 +716,9 @@ def main() -> int:
         print(json.dumps(env, indent=2, default=str))
     else:
         render_md(env, args.sprint)
-    # Exit 0 if any OK or STUB rows exist (stubs are honest success); 1 if all ERROR
+    # Exit 0 if any OK/PARTIAL/STUB (stubs are honest success); 1 if all ERROR
     statuses = {r.get("status") for r in env["providers"]}
-    if statuses <= {"ERROR"}:
+    if statuses and statuses <= {"ERROR"}:
         return 1
     return 0
 

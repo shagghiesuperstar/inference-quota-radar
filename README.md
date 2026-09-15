@@ -43,6 +43,7 @@ See [`docs/PROVIDER_MATRIX.md`](docs/PROVIDER_MATRIX.md).
 - Do not put production keys in caut’s token-account store until at-rest encryption is audited.
 
 ## Build `caut` (optional, for Claude/Codex subscription windows)
+Full steps: [`docs/CAUT.md`](docs/CAUT.md).
 ```bash
 # Toolchain: rustup nightly-2026-08-31 (see upstream rust-toolchain.toml)
 cargo build --release
@@ -51,6 +52,13 @@ cargo build --release
 ```
 On Apple Silicon Homebrew hosts, put rustup ahead of Homebrew rustc:
 `export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH"`.
+
+## Smoke
+```bash
+./scripts/smoke-radar.sh
+# or with secrets injected:
+# bws run -- ./scripts/smoke-radar.sh
+```
 
 ## Verify
 ```bash
