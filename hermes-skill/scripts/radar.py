@@ -20,7 +20,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-SCHEMA = "radar.phase1"
+SCHEMA = "radar.v2"
 UA = "hermes-quota-radar/0.3"
 TIMEOUT = 20
 
@@ -234,6 +234,253 @@ def fetch_deepseek() -> dict:
         )
     except Exception as e:
         return _from_exc("deepseek", "apiToken", "VERIFIED", e)
+
+
+
+
+def _pct(remaining, total):
+    if isinstance(remaining, (int, float)) and isinstance(total, (int, float)) and total > 0:
+        return round(100.0 * float(remaining) / float(total), 2)
+    return None
+
+
+def fetch_minimax_plan(kind: str = "token_plan") -> dict:
+    """MiniMax Token/Coding Plan remains REST. Falls back to mmx CLI path if key unset."""
+    prov = "minimax" if kind == "token_plan" else "minimax_coding"
+    key = _env("MINIMAX_API_KEY", "MINIMAX_API_KEY1ST")
+    if not key:
+        if kind == "token_plan":
+            return fetch_minimax()
+        return _err(prov, "apiToken", "VERIFIED", "MINIMAX_API_KEY unset", "KEY_UNSET")
+    url = f"https://www.minimax.io/v1/{kind}/remains"
+    try:
+        data = _get_json(url, key, headers={"Content-Type": "application/json"})
+    except Exception as e:
+        return _from_exc(prov, "apiToken", "VERIFIED", e)
+    if not isinstance(data, dict):
+        return _err(prov, "apiToken", "VERIFIED", "unexpected payload shape", "PARSE")
+    remains = data.get("model_remains") or []
+    row = remains[0] if remains and isinstance(remains[0], dict) else data
+    # Vendor field current_interval_usage_count is REMAINING (misnamed) — work order VERIFIED
+    pct5 = _pct(row.get("current_interval_usage_count"), row.get("current_interval_total_count"))
+    pctw = _pct(row.get("current_weekly_usage_count"), row.get("current_weekly_total_count"))
+    # Prefer explicit remaining percent if present
+    for k in ("current_interval_remaining_percent", "remaining_percent"):
+        v = row.get(k)
+        if isinstance(v, (int, float)):
+            pct5 = float(v) if pct5 is None else pct5
+            break
+    pcts = [p for p in (pct5, pctw) if p is not None]
+    pct = min(pcts) if pcts else None
+    return _ok(
+        prov, "apiToken", "VERIFIED", pct, data,
+        window="5h+weekly", pct_5h=pct5, pct_weekly=pctw,
+        note="current_interval_usage_count treated as REMAINING per vendor quirk",
+    )
+
+
+def _claude_oauth_token() -> Optional[str]:
+    env_tok = _env("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_tok:
+        return env_tok
+    p = os.path.expanduser("~/.claude/.credentials.json")
+    if os.path.isfile(p):
+        try:
+            with open(p) as f:
+                return (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+        except Exception:
+            return None
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return (json.loads(out.stdout).get("claudeAiOauth") or {}).get("accessToken")
+        except Exception:
+            return None
+    return None
+
+
+def fetch_claude_oauth_direct() -> dict:
+    tok = _claude_oauth_token()
+    if not tok:
+        return _err(
+            "claude_oauth", "oauth", "VERIFIED",
+            "no Claude Code OAuth token on this host", "KEY_UNSET",
+        )
+    try:
+        data = _get_json(
+            "https://api.anthropic.com/api/oauth/usage",
+            tok,
+            headers={"anthropic-beta": "oauth-2025-04-20"},
+        )
+    except Exception as e:
+        return _from_exc("claude_oauth", "oauth", "VERIFIED", e)
+    if not isinstance(data, dict):
+        return _err("claude_oauth", "oauth", "VERIFIED", "unexpected payload shape", "PARSE")
+
+    def rem(block):
+        u = (block or {}).get("utilization")
+        return round(100.0 - float(u), 2) if isinstance(u, (int, float)) else None
+
+    p5, p7 = rem(data.get("five_hour")), rem(data.get("seven_day"))
+    pcts = [p for p in (p5, p7) if p is not None]
+    pct = min(pcts) if pcts else None
+    resets = (data.get("five_hour") or {}).get("resets_at")
+    return _ok(
+        "claude_oauth", "oauth", "VERIFIED", pct, data,
+        window="5h+7d", pct_5h=p5, pct_7d=p7, resets_at=resets,
+    )
+
+
+def fetch_copilot() -> dict:
+    tok = _env("COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN")
+    user = _env("GITHUB_USERNAME")
+    if not tok or not user:
+        return _err(
+            "copilot", "apiToken", "VERIFIED",
+            "COPILOT_GITHUB_TOKEN or GITHUB_USERNAME unset", "KEY_UNSET",
+        )
+    url = f"https://api.github.com/users/{user}/settings/billing/premium_request/usage"
+    try:
+        data = _get_json(
+            url, tok,
+            headers={
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+    except Exception as e:
+        return _from_exc("copilot", "apiToken", "VERIFIED", e)
+    limit = _env("COPILOT_PLAN_LIMIT")
+    pct = None
+    used = None
+    if isinstance(data, dict):
+        used = data.get("premium_request_usage") or data.get("total_premium_request_usage")
+        if used is None and isinstance(data.get("usage_items"), list):
+            # sum numeric quantities if present
+            s = 0
+            any_n = False
+            for it in data["usage_items"]:
+                if isinstance(it, dict) and isinstance(it.get("quantity"), (int, float)):
+                    s += float(it["quantity"]); any_n = True
+            used = s if any_n else None
+    if limit and used is not None:
+        try:
+            lim = float(limit)
+            if lim > 0:
+                pct = round(100.0 * max(0.0, lim - float(used)) / lim, 2)
+        except (TypeError, ValueError):
+            pct = None
+    return _ok(
+        "copilot", "apiToken", "VERIFIED", pct, data, window="monthly",
+        note="official endpoint returns usage rows; pct needs COPILOT_PLAN_LIMIT",
+        used=used, plan_limit=limit,
+    )
+
+
+def fetch_xai_mgmt() -> dict:
+    key, team = _env("XAI_MGMT_KEY"), _env("XAI_TEAM_ID")
+    if not key or not team:
+        return _err(
+            "xai", "apiToken", "VERIFIED",
+            "XAI_MGMT_KEY or XAI_TEAM_ID unset", "KEY_UNSET",
+        )
+    try:
+        bal = _get_json(
+            f"https://management-api.x.ai/v1/billing/teams/{team}/prepaid/balance",
+            key,
+        )
+    except Exception as e:
+        return _from_exc("xai", "apiToken", "VERIFIED", e)
+    pct = None
+    floor = _env("XAI_PREPAID_FLOOR_CENTS")
+    # balance fields: try common shapes without fabricating
+    cents = None
+    if isinstance(bal, dict):
+        for k in ("balance_cents", "prepaid_balance_cents", "amount_cents", "balance"):
+            v = bal.get(k)
+            if isinstance(v, (int, float)):
+                cents = float(v)
+                break
+            if isinstance(v, dict) and isinstance(v.get("amount"), (int, float)):
+                cents = float(v["amount"]); break
+    if floor and cents is not None:
+        try:
+            fl = float(floor)
+            # treat floor as "empty"; pct = how far above floor vs a simple cents scale
+            # without a known full prepaid load, only report PARTIAL with raw balance
+            if fl >= 0 and cents is not None:
+                # if cents <= floor → 0%; else None (no total known) unless floor used as scale
+                if cents <= fl:
+                    pct = 0.0
+        except (TypeError, ValueError):
+            pct = None
+    return _ok(
+        "xai", "apiToken", "VERIFIED", pct, bal, window="prepaid",
+        note="prepaid balance; pct only 0 when at/under XAI_PREPAID_FLOOR_CENTS (no total known)",
+        balance_cents=cents,
+    )
+
+
+def _hermes_venv_python() -> Optional[str]:
+    for c in (
+        os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python"),
+        os.path.expanduser("~/.hermes/hermes-agent/.venv/bin/python"),
+    ):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def fetch_nous_bridge(profile: str = "ss") -> dict:
+    py = _hermes_venv_python()
+    if not py:
+        return _err("nous", "hermesBridge", "VERIFIED", "hermes venv not found on host", "CLI_MISSING")
+    snippet = os.environ.get("RADAR_NOUS_SNIPPET", "")
+    if not snippet:
+        return _stub(
+            "nous",
+            "RADAR_NOUS_SNIPPET unset; set after A3 discovery",
+            "hermesBridge",
+            "VERIFIED",
+        )
+    env = {**os.environ, "HERMES_PROFILE": profile}
+    profile_home = os.path.expanduser(f"~/.hermes/profiles/{profile}")
+    if os.path.isdir(profile_home):
+        env["HERMES_HOME"] = profile_home
+    try:
+        p = subprocess.run(
+            [py, "-c", snippet],
+            capture_output=True, text=True, timeout=60,
+            env=env,
+            cwd=os.path.expanduser("~/.hermes/hermes-agent"),
+        )
+        if p.returncode != 0 or not p.stdout.strip():
+            return _err(
+                "nous", "hermesBridge", "VERIFIED",
+                (p.stderr or p.stdout or "")[:200], "CLI_FAILED",
+            )
+        data = json.loads(p.stdout)
+    except subprocess.TimeoutExpired:
+        return _err("nous", "hermesBridge", "VERIFIED", "bridge timed out", "TIMEOUT")
+    except Exception as e:
+        return _err("nous", "hermesBridge", "VERIFIED", str(e), "CLI_FAILED")
+    if not isinstance(data, dict):
+        return _err("nous", "hermesBridge", "VERIFIED", "snippet did not return JSON object", "PARSE")
+    pct = _pct(data.get("credits_remaining"), data.get("monthly_credits"))
+    # credits_remaining can be ~0; still a real number
+    if pct is None and isinstance(data.get("credits_remaining"), (int, float)) and isinstance(data.get("monthly_credits"), (int, float)):
+        mc = float(data["monthly_credits"])
+        if mc > 0:
+            pct = round(100.0 * max(0.0, float(data["credits_remaining"])) / mc, 2)
+    resets = data.get("current_period_end") or data.get("resets_at")
+    return _ok(
+        "nous", "hermesBridge", "VERIFIED", pct, data,
+        window="monthly", resets_at=resets,
+    )
 
 
 def fetch_minimax() -> dict:
@@ -534,6 +781,10 @@ def fetch_codex() -> dict:
 
 
 def fetch_claude_oauth() -> dict:
+    """Prefer direct OAuth usage API; fall through to caut only on KEY_UNSET."""
+    direct = fetch_claude_oauth_direct()
+    if direct.get("error_class") != "KEY_UNSET":
+        return direct
     caut = _caut_bin()
     if caut:
         try:
@@ -559,16 +810,17 @@ def fetch_claude_oauth() -> dict:
     if shutil.which("claude"):
         return _stub(
             "claude_oauth",
-            "claude CLI present but caut binary missing — wire caut OAuth after build (docs/CAUT.md)",
+            "no OAuth token; claude CLI present but caut binary missing — wire caut OAuth after build (docs/CAUT.md)",
             "cli",
             "VERIFIED",
         )
     return _stub(
         "claude_oauth",
-        "caut not built — Claude Code / subscription usage via caut OAuth later (docs/CAUT.md)",
+        "no Claude Code OAuth token and caut not built — set CLAUDE_CODE_OAUTH_TOKEN or build caut",
         "oauth",
         "VERIFIED",
     )
+
 
 
 def fetch_devin() -> dict:
@@ -627,18 +879,20 @@ def fetch_local_probe(name: str, base_url: str) -> dict:
 PROVIDERS: list[tuple[str, Callable[[], dict]]] = [
     ("openrouter", fetch_openrouter),
     ("deepseek", fetch_deepseek),
-    ("minimax", fetch_minimax),
-    ("xai", fetch_xai),
+    ("minimax", lambda: fetch_minimax_plan("token_plan")),
+    ("minimax_coding", lambda: fetch_minimax_plan("coding_plan")),
+    ("xai", fetch_xai_mgmt),
     ("openai", fetch_openai),
     ("anthropic", fetch_anthropic),
     ("nvidia", fetch_nvidia),
     ("gemini", fetch_gemini),
     ("cerebras", fetch_cerebras),
     ("huggingface", fetch_huggingface),
-    ("nous", fetch_nous),
+    ("nous", fetch_nous_bridge),
     ("cursor", fetch_cursor),
     ("codex", fetch_codex),
     ("claude_oauth", fetch_claude_oauth),
+    ("copilot", fetch_copilot),
     ("devin", fetch_devin),
     ("droid", fetch_droid),
     ("cognition", fetch_cognition),
